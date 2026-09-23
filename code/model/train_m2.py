@@ -15,7 +15,7 @@ from .data import AVStandardizer, AlignedMoseiDataset, load_pickle
 from .engine import evaluate_model, inverse_frequency_class_weights, train_one_epoch
 from .losses import M2Objective
 from .metrics import composite_score
-from .model import M2Model, checkpoint_state, load_checkpoint_state
+from .model import M2Model, checkpoint_state, create_ema_teacher, load_checkpoint_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-mask-rate", type=float, default=0.60)
     parser.add_argument("--valid-mask-rate", type=float, default=0.30)
     parser.add_argument("--consistency-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--distill",
+        action="store_true",
+        help="Enable clean-view EMA teacher to masked-view student distillation",
+    )
+    parser.add_argument("--teacher-ema-decay", type=float, default=0.996)
+    parser.add_argument("--distill-temperature", type=float, default=2.0)
+    parser.add_argument("--distill-logit-weight", type=float, default=0.5)
+    parser.add_argument("--distill-regression-weight", type=float, default=0.25)
+    parser.add_argument("--distill-feature-weight", type=float, default=0.1)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-valid-samples", type=int)
     parser.add_argument("--max-test-samples", type=int)
@@ -74,6 +84,14 @@ def seed_everything(seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.teacher_ema_decay < 1.0:
+        raise ValueError("--teacher-ema-decay must satisfy 0 <= decay < 1")
+    if min(
+        args.distill_logit_weight,
+        args.distill_regression_weight,
+        args.distill_feature_weight,
+    ) < 0:
+        raise ValueError("distillation loss weights must be non-negative")
     seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     data = load_pickle(args.data)
@@ -122,12 +140,20 @@ def main() -> None:
         max_rate=args.max_mask_rate,
     )
     device = torch.device(args.device)
-    model = M2Model(model_config).to(device)
+    model = M2Model(model_config)
+    teacher = create_ema_teacher(model) if args.distill else None
+    model = model.to(device)
+    if teacher is not None:
+        teacher = teacher.to(device)
     labels = np.asarray(data["train"]["classification_labels"])[: len(datasets["train"])]
     class_weights = inverse_frequency_class_weights(labels).to(device)
     objective = M2Objective(
         class_weights=class_weights,
         consistency_weight=args.consistency_weight,
+        distill_temperature=args.distill_temperature,
+        distill_logit_weight=args.distill_logit_weight,
+        distill_regression_weight=args.distill_regression_weight,
+        distill_feature_weight=args.distill_feature_weight,
     ).to(device)
     bert_parameters = []
     other_parameters = []
@@ -158,6 +184,8 @@ def main() -> None:
             mask_config,
             device,
             mask_generator,
+            teacher=teacher,
+            teacher_ema_decay=args.teacher_ema_decay,
         )
         scheduler.step()
         valid_clean = evaluate_model(model, loaders["valid"], device)
@@ -195,6 +223,14 @@ def main() -> None:
                     "valid_clean": valid_clean,
                     "valid_masked": valid_masked,
                     "selection_score": score,
+                    "distillation": {
+                        "enabled": args.distill,
+                        "teacher_ema_decay": args.teacher_ema_decay,
+                        "temperature": args.distill_temperature,
+                        "logit_weight": args.distill_logit_weight,
+                        "regression_weight": args.distill_regression_weight,
+                        "feature_weight": args.distill_feature_weight,
+                    },
                 },
                 checkpoint_path,
             )

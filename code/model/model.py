@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import torch
@@ -497,6 +498,44 @@ class M2Model(nn.Module):
             "vision_attention": vision_attention,
             "missing_ratio": missing_ratio,
         }
+
+
+def create_ema_teacher(student: M2Model) -> M2Model:
+    """Create a non-trainable teacher initialized from the student.
+
+    A frozen Hugging Face BERT is shared because it never receives an EMA
+    update. This avoids storing a second 110M-parameter BERT on the GPU.
+    """
+
+    teacher = copy.deepcopy(student)
+    if student.config.text_backend == "hf" and student.config.freeze_bert:
+        teacher.text_encoder.backbone = student.text_encoder.backbone
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher
+
+
+@torch.no_grad()
+def update_ema_teacher(student: M2Model, teacher: M2Model, decay: float) -> None:
+    """Update teacher parameters/buffers with an exponential moving average."""
+
+    if not 0.0 <= decay < 1.0:
+        raise ValueError("EMA decay must satisfy 0 <= decay < 1")
+    student_parameters = dict(student.named_parameters())
+    for name, teacher_parameter in teacher.named_parameters():
+        student_parameter = student_parameters[name]
+        if teacher_parameter.data_ptr() == student_parameter.data_ptr():
+            continue
+        teacher_parameter.lerp_(student_parameter.detach(), 1.0 - decay)
+    student_buffers = dict(student.named_buffers())
+    for name, teacher_buffer in teacher.named_buffers():
+        student_buffer = student_buffers[name]
+        if teacher_buffer.data_ptr() == student_buffer.data_ptr():
+            continue
+        if teacher_buffer.is_floating_point():
+            teacher_buffer.lerp_(student_buffer.detach(), 1.0 - decay)
+        else:
+            teacher_buffer.copy_(student_buffer)
 
 
 def checkpoint_state(model: M2Model) -> tuple[dict[str, torch.Tensor], bool]:

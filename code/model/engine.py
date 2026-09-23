@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from .config import SpanMaskConfig
 from .masking import corrupt_aligned_batch
 from .metrics import classification_regression_metrics
+from .model import M2Model, update_ema_teacher
 
 
 def move_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -27,7 +28,7 @@ def inverse_frequency_class_weights(labels: np.ndarray, num_classes: int = 3) ->
 
 
 def train_one_epoch(
-    model: torch.nn.Module,
+    model: M2Model,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     objective: torch.nn.Module,
@@ -35,8 +36,12 @@ def train_one_epoch(
     device: torch.device,
     generator: torch.Generator,
     clip_grad_norm: float = 1.0,
+    teacher: M2Model | None = None,
+    teacher_ema_decay: float = 0.996,
 ) -> dict[str, float]:
     model.train()
+    if teacher is not None:
+        teacher.eval()
     totals: dict[str, float] = defaultdict(float)
     samples = 0
     for cpu_batch in loader:
@@ -44,6 +49,10 @@ def train_one_epoch(
         clean = move_to_device(cpu_batch, device)
         masked = move_to_device(masked_cpu, device)
         optimizer.zero_grad(set_to_none=True)
+        teacher_output = None
+        if teacher is not None:
+            with torch.no_grad():
+                teacher_output = teacher(clean)
         clean_output = model(clean)
         masked_output = model(masked)
         losses = objective(
@@ -51,11 +60,14 @@ def train_one_epoch(
             masked_output,
             clean["class_label"],
             clean["regression_label"],
+            teacher_output=teacher_output,
         )
         losses["loss"].backward()
         if clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
         optimizer.step()
+        if teacher is not None:
+            update_ema_teacher(model, teacher, teacher_ema_decay)
         batch_size = int(clean["class_label"].shape[0])
         samples += batch_size
         for key, value in losses.items():
