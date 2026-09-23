@@ -46,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-backend", choices=("lightweight", "hf"), default="hf")
     parser.add_argument("--bert-model-name", default=DEFAULT_BERT_PATH)
     parser.add_argument("--finetune-bert", action="store_true")
+    parser.add_argument(
+        "--fusion-type",
+        choices=("cross_gated", "vertfound_multilevel"),
+        default="cross_gated",
+        help="Baseline single-level fusion or VertFound-style multi-level bidirectional fusion",
+    )
+    parser.add_argument("--fusion-levels", type=int, default=2)
     parser.add_argument("--clean-probability", type=float, default=0.25)
     parser.add_argument("--min-mask-rate", type=float, default=0.05)
     parser.add_argument("--max-mask-rate", type=float, default=0.60)
@@ -106,6 +113,8 @@ def main() -> None:
         text_backend=args.text_backend,
         bert_model_name=args.bert_model_name,
         freeze_bert=not args.finetune_bert,
+        fusion_type=args.fusion_type,
+        fusion_levels=args.fusion_levels,
     )
     mask_config = SpanMaskConfig(
         clean_probability=args.clean_probability,

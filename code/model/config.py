@@ -30,12 +30,25 @@ class M2Config:
     text_backend: str = "hf"
     bert_model_name: str = DEFAULT_BERT_PATH
     freeze_bert: bool = True
+    fusion_type: str = "cross_gated"
+    fusion_levels: int = 2
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if self.text_backend not in {"lightweight", "hf"}:
             raise ValueError("text_backend must be 'lightweight' or 'hf'")
+        if self.fusion_type not in {"cross_gated", "vertfound_multilevel"}:
+            raise ValueError(
+                "fusion_type must be 'cross_gated' or 'vertfound_multilevel'"
+            )
+        if self.fusion_levels < 1:
+            raise ValueError("fusion_levels must be at least 1")
+        if self.fusion_type == "vertfound_multilevel":
+            if self.fusion_levels > self.modality_layers:
+                raise ValueError("fusion_levels cannot exceed modality_layers")
+            if self.text_backend == "lightweight" and self.fusion_levels > self.text_layers:
+                raise ValueError("fusion_levels cannot exceed text_layers for lightweight text")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

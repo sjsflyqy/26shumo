@@ -42,8 +42,8 @@ def main() -> None:
         vision_dim=3,
         hidden_dim=16,
         num_heads=4,
-        modality_layers=1,
-        text_layers=1,
+        modality_layers=2,
+        text_layers=2,
         feedforward_dim=32,
         dropout=0.0,
         max_text_len=10,
@@ -85,6 +85,28 @@ def main() -> None:
     losses = M2Objective()(clean_output, masked_output, clean["class_label"], clean["regression_label"])
     losses["loss"].backward()
     assert torch.isfinite(losses["loss"])
+
+    multilevel_config = M2Config.from_dict(
+        config.to_dict() | {"fusion_type": "vertfound_multilevel", "fusion_levels": 2}
+    )
+    multilevel_model = M2Model(multilevel_config)
+    multilevel_clean = multilevel_model(clean)
+    multilevel_masked = multilevel_model(masked)
+    assert multilevel_clean["class_logits"].shape == (3, 3)
+    assert multilevel_clean["fusion_level_weights"].shape == (3, 10, 2)
+    assert torch.allclose(
+        multilevel_clean["fusion_level_weights"].sum(dim=-1),
+        torch.ones(3, 10),
+    )
+    assert torch.isfinite(multilevel_masked["class_logits"]).all()
+    multilevel_losses = M2Objective()(
+        multilevel_clean,
+        multilevel_masked,
+        clean["class_label"],
+        clean["regression_label"],
+    )
+    multilevel_losses["loss"].backward()
+    assert torch.isfinite(multilevel_losses["loss"])
     print("M2 synthetic smoke test passed")
 
 
