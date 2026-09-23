@@ -1,0 +1,23 @@
+# Ignore everything by default. Only code is included below.
+/*
+
+# Keep this ignore file itself.
+!/.gitignore
+
+# Re-include the code subtree.
+!/code/
+!/code/**
+
+# Markdown documents are not uploaded, including those under code.
+**/*.md
+**/*.markdown
+
+# Python-generated files are not source code.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+
+# Local editor and operating-system files.
+**/.DS_Store
+**/.vscode/
+**/.idea/
