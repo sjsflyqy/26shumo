@@ -68,6 +68,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clean-probability", type=float, default=0.25)
     parser.add_argument("--min-mask-rate", type=float, default=0.05)
     parser.add_argument("--max-mask-rate", type=float, default=0.60)
+    parser.add_argument("--min-mask-spans", type=int, default=1)
+    parser.add_argument("--max-mask-spans", type=int, default=3)
+    parser.add_argument("--sync-probability", type=float, default=0.5)
+    parser.add_argument(
+        "--mask-combinations", nargs="+",
+        choices=("T", "A", "V", "TA", "TV", "AV", "TAV"),
+        default=list(SpanMaskConfig().modality_combinations),
+        help="Training modality-combination choices; repeated entries increase sampling weight",
+    )
+    parser.add_argument(
+        "--mask-locations", nargs="+", choices=("random", "begin", "middle", "end"),
+        default=list(SpanMaskConfig().locations),
+        help="Training location choices; repeated entries increase sampling weight",
+    )
     parser.add_argument("--valid-mask-rate", type=float, default=0.30)
     parser.add_argument(
         "--emotion-mask-probability", type=float, default=0.0,
@@ -185,6 +199,11 @@ def main() -> None:
         clean_probability=args.clean_probability,
         min_rate=args.min_mask_rate,
         max_rate=args.max_mask_rate,
+        min_spans=args.min_mask_spans,
+        max_spans=args.max_mask_spans,
+        sync_probability=args.sync_probability,
+        modality_combinations=tuple(args.mask_combinations),
+        locations=tuple(args.mask_locations),
     )
     device = torch.device(args.device)
     model = M2Model(model_config)

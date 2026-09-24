@@ -73,6 +73,11 @@ def _guided_relative_starts(
         available = [
             start for start in candidates if not occupied[start : start + width].any()
         ]
+        if not available:
+            available = [
+                start for start in range(length - width + 1)
+                if not occupied[start : start + width].any()
+            ]
         if available:
             candidates = available
         window_scores = torch.tensor(
@@ -113,13 +118,25 @@ def _span_mask(
             valid_positions, importance, rate, spans, location, temperature, generator
         )
     base, remainder = divmod(total, spans)
+    occupied = torch.zeros(int(positions.numel()), dtype=torch.bool)
     for span_index in range(spans):
         span_length = base + int(span_index < remainder)
         if not relative_starts:
-            start = _choose_start(int(positions.numel()), span_length, location, generator)
+            proposed = _choose_start(int(positions.numel()), span_length, location, generator)
         else:
             maximum = max(0, int(positions.numel()) - span_length)
-            start = int(round(relative_starts[span_index % len(relative_starts)] * maximum))
+            proposed = int(round(relative_starts[span_index % len(relative_starts)] * maximum))
+        allowed = [
+            value for value in _start_candidates(int(positions.numel()), span_length, location)
+            if not occupied[value : value + span_length].any()
+        ]
+        if not allowed:
+            allowed = [
+                value for value in range(int(positions.numel()) - span_length + 1)
+                if not occupied[value : value + span_length].any()
+            ]
+        start = min(allowed, key=lambda value: abs(value - proposed)) if allowed else proposed
+        occupied[start : start + span_length] = True
         output[positions[start : start + span_length]] = True
     return output
 

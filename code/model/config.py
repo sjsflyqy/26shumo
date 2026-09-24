@@ -95,6 +95,14 @@ class SpanMaskConfig:
             raise ValueError("invalid span count range")
         if not 0.0 <= self.sync_probability <= 1.0:
             raise ValueError("sync_probability must be in [0, 1]")
+        valid_combinations = {"T", "A", "V", "TA", "TV", "AV", "TAV"}
+        if not self.modality_combinations or any(
+            value not in valid_combinations for value in self.modality_combinations
+        ):
+            raise ValueError("modality_combinations must contain valid nonempty T/A/V combinations")
+        valid_locations = {"random", "begin", "middle", "end"}
+        if not self.locations or any(value not in valid_locations for value in self.locations):
+            raise ValueError("locations must contain valid nonempty locations")
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
