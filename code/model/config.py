@@ -32,6 +32,9 @@ class M2Config:
     freeze_bert: bool = True
     fusion_type: str = "cross_gated"
     fusion_levels: int = 2
+    av_encoder_type: str = "transformer"
+    use_latent_generator: bool = False
+    generator_window: int = 7
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -42,6 +45,10 @@ class M2Config:
             raise ValueError(
                 "fusion_type must be 'cross_gated' or 'vertfound_multilevel'"
             )
+        if self.av_encoder_type not in {"transformer", "mlp"}:
+            raise ValueError("av_encoder_type must be 'transformer' or 'mlp'")
+        if self.generator_window < 1 or self.generator_window % 2 != 1:
+            raise ValueError("generator_window must be a positive odd integer")
         if self.fusion_levels < 1:
             raise ValueError("fusion_levels must be at least 1")
         if self.fusion_type == "vertfound_multilevel":

@@ -41,6 +41,9 @@ class M2Objective(nn.Module):
         distill_logit_weight: float = 0.5,
         distill_regression_weight: float = 0.25,
         distill_feature_weight: float = 0.1,
+        distill_enabled: bool = True,
+        reconstruction_weight: float = 0.0,
+        confidence_weight: float = 0.0,
     ) -> None:
         super().__init__()
         if class_weights is not None:
@@ -57,6 +60,11 @@ class M2Objective(nn.Module):
         self.distill_logit_weight = distill_logit_weight
         self.distill_regression_weight = distill_regression_weight
         self.distill_feature_weight = distill_feature_weight
+        self.distill_enabled = distill_enabled
+        if reconstruction_weight < 0 or confidence_weight < 0:
+            raise ValueError("generator loss weights must be non-negative")
+        self.reconstruction_weight = reconstruction_weight
+        self.confidence_weight = confidence_weight
 
     def _task_loss(
         self,
@@ -78,6 +86,9 @@ class M2Objective(nn.Module):
         class_label: torch.Tensor,
         regression_label: torch.Tensor,
         teacher_output: dict[str, torch.Tensor] | None = None,
+        *,
+        clean_batch: dict[str, torch.Tensor] | None = None,
+        masked_batch: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         clean, clean_cls, clean_reg = self._task_loss(
             clean_output, class_label, regression_label
@@ -97,7 +108,61 @@ class M2Objective(nn.Module):
             "masked_regression": masked_reg,
             "consistency": consistency,
         }
-        if teacher_output is not None:
+        if teacher_output is not None and "latent_proposals" in masked_output:
+            if clean_batch is None or masked_batch is None:
+                raise ValueError("generator loss requires clean_batch and masked_batch")
+            if "corruption_mask" in masked_batch:
+                artificial = tuple(masked_batch["corruption_mask"][..., index] for index in range(3))
+                clean_observed = tuple(clean_batch["reliability_mask"][..., index] for index in range(3))
+            else:
+                artificial = tuple(
+                    masked_batch[f"{name}_corruption_mask"] for name in ("text", "audio", "vision")
+                )
+                clean_observed = (
+                    clean_batch["text_attention_mask"],
+                    clean_batch["audio_reliability_mask"],
+                    clean_batch["vision_reliability_mask"],
+                )
+            reconstruction_terms = []
+            confidence_terms = []
+            reconstructed_positions = 0
+            for index in range(3):
+                selected = artificial[index].bool() & clean_observed[index].bool()
+                if not bool(selected.any()):
+                    continue
+                reconstructed_positions += int(selected.sum())
+                target = teacher_output["latent_targets"][index].detach()[selected]
+                proposal = masked_output["latent_proposals"][index][selected]
+                blend = masked_output["latent_reconstruction"][index][selected]
+                confidence = masked_output["latent_confidence"][index][selected]
+                cosine = F.cosine_similarity(proposal, target, dim=-1)
+                reconstruction_terms.append(
+                    F.smooth_l1_loss(proposal, target)
+                    + 0.25 * (1.0 - cosine).mean()
+                    + 0.5 * F.smooth_l1_loss(blend, target)
+                )
+                quality = ((cosine.detach() - 0.2) / 0.6).clamp(0.0, 1.0)
+                confidence_terms.append(F.mse_loss(confidence, quality))
+            if reconstruction_terms:
+                reconstruction = torch.stack(reconstruction_terms).mean()
+                confidence_loss = torch.stack(confidence_terms).mean()
+            else:
+                reconstruction = total.new_zeros(())
+                confidence_loss = total.new_zeros(())
+            total = (
+                total
+                + self.reconstruction_weight * reconstruction
+                + self.confidence_weight * confidence_loss
+            )
+            losses.update(
+                {
+                    "loss": total,
+                    "reconstruction": reconstruction,
+                    "generator_confidence": confidence_loss,
+                    "reconstructed_positions": total.new_tensor(float(reconstructed_positions)),
+                }
+            )
+        if teacher_output is not None and self.distill_enabled:
             distill_logits = soft_target_distillation(
                 masked_output["class_logits"],
                 teacher_output["class_logits"],

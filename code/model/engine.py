@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import SpanMaskConfig
-from .masking import corrupt_aligned_batch
+from .masking import corrupt_aligned_batch, teacher_emotion_importance
 from .metrics import classification_regression_metrics
 from .model import M2Model, update_ema_teacher
 
@@ -38,6 +38,9 @@ def train_one_epoch(
     clip_grad_norm: float = 1.0,
     teacher: M2Model | None = None,
     teacher_ema_decay: float = 0.996,
+    emotion_mask_probability: float = 0.0,
+    emotion_mask_temperature: float = 0.2,
+    emotion_intensity_weight: float = 0.25,
 ) -> dict[str, float]:
     model.train()
     if teacher is not None:
@@ -45,14 +48,36 @@ def train_one_epoch(
     totals: dict[str, float] = defaultdict(float)
     samples = 0
     for cpu_batch in loader:
-        masked_cpu = corrupt_aligned_batch(cpu_batch, mask_config, generator)
         clean = move_to_device(cpu_batch, device)
-        masked = move_to_device(masked_cpu, device)
-        optimizer.zero_grad(set_to_none=True)
+        importance = None
         teacher_output = None
         if teacher is not None:
-            with torch.no_grad():
-                teacher_output = teacher(clean)
+            if emotion_mask_probability > 0:
+                with torch.enable_grad():
+                    guided_output = teacher(clean, capture_saliency=True)
+                    importance = teacher_emotion_importance(
+                        guided_output, clean, intensity_weight=emotion_intensity_weight
+                    )
+                teacher_output = {
+                    key: tuple(value.detach() for value in item)
+                    if isinstance(item, tuple) else item.detach()
+                    for key, item in guided_output.items()
+                    if key in {"class_logits", "intensity", "fusion_feature", "latent_targets"}
+                }
+                del guided_output
+            else:
+                with torch.no_grad():
+                    teacher_output = teacher(clean)
+        masked_cpu = corrupt_aligned_batch(
+            cpu_batch,
+            mask_config,
+            generator,
+            importance=importance,
+            emotion_probability=emotion_mask_probability,
+            emotion_temperature=emotion_mask_temperature,
+        )
+        masked = move_to_device(masked_cpu, device)
+        optimizer.zero_grad(set_to_none=True)
         clean_output = model(clean)
         masked_output = model(masked)
         losses = objective(
@@ -61,6 +86,8 @@ def train_one_epoch(
             clean["class_label"],
             clean["regression_label"],
             teacher_output=teacher_output,
+            clean_batch=clean,
+            masked_batch=masked,
         )
         losses["loss"].backward()
         if clip_grad_norm > 0:
@@ -71,7 +98,7 @@ def train_one_epoch(
         batch_size = int(clean["class_label"].shape[0])
         samples += batch_size
         for key, value in losses.items():
-            totals[key] += float(value.detach()) * batch_size
+            totals[key] += float(value.detach()) * (1 if key == "reconstructed_positions" else batch_size)
     return {key: value / max(samples, 1) for key, value in totals.items()}
 
 
@@ -87,6 +114,7 @@ def evaluate_model(
     mask_modalities: str | None = None,
     mask_location: str | None = None,
     mask_spans: int | None = None,
+    mask_sync: bool | None = None,
 ) -> dict[str, float]:
     model.eval()
     class_truth: list[np.ndarray] = []
@@ -104,6 +132,7 @@ def evaluate_model(
                 force_modalities=mask_modalities,
                 force_location=mask_location,
                 force_spans=mask_spans,
+                force_sync=mask_sync,
             )
         batch = move_to_device(cpu_batch, device)
         output = model(batch)

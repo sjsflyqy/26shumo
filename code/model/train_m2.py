@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import DEFAULT_BERT_PATH, M2Config, SpanMaskConfig
-from .data import AVStandardizer, AlignedMoseiDataset, load_pickle
+from .data import AVStandardizer, infer_alignment, load_pickle, make_mosei_dataset
 from .engine import evaluate_model, inverse_frequency_class_weights, train_one_epoch
 from .losses import M2Objective
 from .metrics import composite_score
@@ -19,7 +19,7 @@ from .model import M2Model, checkpoint_state, create_ema_teacher, load_checkpoin
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the aligned M2 robust sentiment model")
+    parser = argparse.ArgumentParser(description="Train M2 on aligned or unaligned MOSEI features")
     parser.add_argument(
         "--data",
         type=Path,
@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parents[2] / "outputs/m2_aligned",
+    )
+    parser.add_argument(
+        "--alignment",
+        choices=("auto", "aligned", "unaligned"),
+        default="auto",
+        help="Data layout; auto infers it from the T/A/V sequence lengths",
     )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -42,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--encoder-layers", type=int, default=2)
+    parser.add_argument(
+        "--av-encoder",
+        choices=("transformer", "mlp"),
+        default="transformer",
+        help="Temporal Transformer or lightweight point-wise residual MLP for audio/vision",
+    )
     parser.add_argument("--dropout", type=float, default=0.25)
     parser.add_argument("--text-backend", choices=("lightweight", "hf"), default="hf")
     parser.add_argument("--bert-model-name", default=DEFAULT_BERT_PATH)
@@ -57,6 +69,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-mask-rate", type=float, default=0.05)
     parser.add_argument("--max-mask-rate", type=float, default=0.60)
     parser.add_argument("--valid-mask-rate", type=float, default=0.30)
+    parser.add_argument(
+        "--emotion-mask-probability", type=float, default=0.0,
+        help="Maximum fraction of training samples using EMA-teacher emotion saliency",
+    )
+    parser.add_argument("--emotion-mask-warmup-epochs", type=int, default=3)
+    parser.add_argument("--emotion-mask-ramp-epochs", type=int, default=5)
+    parser.add_argument("--emotion-mask-temperature", type=float, default=0.2)
+    parser.add_argument("--emotion-intensity-weight", type=float, default=0.25)
+    parser.add_argument("--latent-generator", action="store_true")
+    parser.add_argument("--generator-window", type=int, default=7)
+    parser.add_argument("--reconstruction-weight", type=float, default=0.1)
+    parser.add_argument("--confidence-weight", type=float, default=0.02)
     parser.add_argument("--consistency-weight", type=float, default=0.10)
     parser.add_argument(
         "--distill",
@@ -92,6 +116,14 @@ def main() -> None:
         args.distill_feature_weight,
     ) < 0:
         raise ValueError("distillation loss weights must be non-negative")
+    if not 0.0 <= args.emotion_mask_probability <= 1.0:
+        raise ValueError("--emotion-mask-probability must be in [0, 1]")
+    if args.emotion_mask_warmup_epochs < 0 or args.emotion_mask_ramp_epochs < 1:
+        raise ValueError("emotion mask warmup must be non-negative and ramp must be positive")
+    if args.emotion_mask_temperature <= 0 or args.emotion_intensity_weight < 0:
+        raise ValueError("emotion mask temperature must be positive and intensity weight non-negative")
+    if args.reconstruction_weight < 0 or args.confidence_weight < 0:
+        raise ValueError("generator loss weights must be non-negative")
     seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     data = load_pickle(args.data)
@@ -99,10 +131,17 @@ def main() -> None:
     if not required.issubset(data):
         raise KeyError(f"Expected splits {sorted(required)}, found {sorted(data)}")
     standardizer = AVStandardizer.fit(data["train"])
+    alignment = infer_alignment(data["train"]) if args.alignment == "auto" else args.alignment
     datasets = {
-        "train": AlignedMoseiDataset(data["train"], standardizer, args.max_train_samples),
-        "valid": AlignedMoseiDataset(data["valid"], standardizer, args.max_valid_samples),
-        "test": AlignedMoseiDataset(data["test"], standardizer, args.max_test_samples),
+        "train": make_mosei_dataset(
+            data["train"], standardizer, args.max_train_samples, alignment
+        ),
+        "valid": make_mosei_dataset(
+            data["valid"], standardizer, args.max_valid_samples, alignment
+        ),
+        "test": make_mosei_dataset(
+            data["test"], standardizer, args.max_test_samples, alignment
+        ),
     }
     train_generator = torch.Generator().manual_seed(args.seed)
     loaders = {
@@ -133,6 +172,14 @@ def main() -> None:
         freeze_bert=not args.finetune_bert,
         fusion_type=args.fusion_type,
         fusion_levels=args.fusion_levels,
+        av_encoder_type=args.av_encoder,
+        use_latent_generator=args.latent_generator,
+        generator_window=args.generator_window,
+        max_text_len=int(np.asarray(data["train"]["text_bert"]).shape[-1]),
+        max_av_len=max(
+            int(np.asarray(data["train"]["audio"]).shape[1]),
+            int(np.asarray(data["train"]["vision"]).shape[1]),
+        ),
     )
     mask_config = SpanMaskConfig(
         clean_probability=args.clean_probability,
@@ -141,7 +188,9 @@ def main() -> None:
     )
     device = torch.device(args.device)
     model = M2Model(model_config)
-    teacher = create_ema_teacher(model) if args.distill else None
+    teacher = create_ema_teacher(model) if (
+        args.distill or args.emotion_mask_probability > 0 or args.latent_generator
+    ) else None
     model = model.to(device)
     if teacher is not None:
         teacher = teacher.to(device)
@@ -154,6 +203,9 @@ def main() -> None:
         distill_logit_weight=args.distill_logit_weight,
         distill_regression_weight=args.distill_regression_weight,
         distill_feature_weight=args.distill_feature_weight,
+        distill_enabled=args.distill,
+        reconstruction_weight=args.reconstruction_weight if args.latent_generator else 0.0,
+        confidence_weight=args.confidence_weight if args.latent_generator else 0.0,
     ).to(device)
     bert_parameters = []
     other_parameters = []
@@ -176,6 +228,10 @@ def main() -> None:
     checkpoint_path = args.output_dir / "best_m2.pt"
 
     for epoch in range(1, args.epochs + 1):
+        emotion_probability = args.emotion_mask_probability * min(
+            1.0,
+            max(0.0, (epoch - args.emotion_mask_warmup_epochs) / args.emotion_mask_ramp_epochs),
+        )
         train_losses = train_one_epoch(
             model,
             loaders["train"],
@@ -186,6 +242,9 @@ def main() -> None:
             mask_generator,
             teacher=teacher,
             teacher_ema_decay=args.teacher_ema_decay,
+            emotion_mask_probability=emotion_probability,
+            emotion_mask_temperature=args.emotion_mask_temperature,
+            emotion_intensity_weight=args.emotion_intensity_weight,
         )
         scheduler.step()
         valid_clean = evaluate_model(model, loaders["valid"], device)
@@ -202,6 +261,7 @@ def main() -> None:
             "epoch": epoch,
             "learning_rate": optimizer.param_groups[0]["lr"],
             "train": train_losses,
+            "emotion_mask_probability": emotion_probability,
             "valid_clean": valid_clean,
             "valid_masked": valid_masked,
             "selection_score": score,
@@ -220,6 +280,7 @@ def main() -> None:
                     "model_config": model_config.to_dict(),
                     "mask_config": mask_config.to_dict(),
                     "standardizer": standardizer.state_dict(),
+                    "alignment": alignment,
                     "valid_clean": valid_clean,
                     "valid_masked": valid_masked,
                     "selection_score": score,
@@ -230,6 +291,19 @@ def main() -> None:
                         "logit_weight": args.distill_logit_weight,
                         "regression_weight": args.distill_regression_weight,
                         "feature_weight": args.distill_feature_weight,
+                    },
+                    "emotion_masking": {
+                        "maximum_probability": args.emotion_mask_probability,
+                        "warmup_epochs": args.emotion_mask_warmup_epochs,
+                        "ramp_epochs": args.emotion_mask_ramp_epochs,
+                        "temperature": args.emotion_mask_temperature,
+                        "intensity_weight": args.emotion_intensity_weight,
+                    },
+                    "latent_generation": {
+                        "enabled": args.latent_generator,
+                        "window": args.generator_window,
+                        "reconstruction_weight": args.reconstruction_weight,
+                        "confidence_weight": args.confidence_weight,
                     },
                 },
                 checkpoint_path,
